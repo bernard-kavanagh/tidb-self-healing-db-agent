@@ -1,7 +1,7 @@
 """
 TiDB Cloud Branch Manager
 --------------------------
-Wraps the TiDB Cloud REST API (v1beta) to create, poll, and delete
+Wraps the TiDB Cloud REST API (v1beta1) to create, poll, and delete
 database branches for the Safety Sandbox workflow.
 
 Requires: TIDB_CLOUD_PUBLIC_KEY, TIDB_CLOUD_PRIVATE_KEY,
@@ -10,22 +10,35 @@ Requires: TIDB_CLOUD_PUBLIC_KEY, TIDB_CLOUD_PRIVATE_KEY,
 
 import os
 import time
+import secrets
+import string
 import requests
 from requests.auth import HTTPDigestAuth
 from dotenv import load_dotenv
 
 load_dotenv()
 
+# Branch password is stored here after creation so callers can retrieve it.
+# Key: branch_id → password string.
+_branch_passwords: dict = {}
+
+
+def _generate_password(length: int = 20) -> str:
+    """Generates a random password that meets TiDB Cloud's requirements."""
+    alphabet = string.ascii_letters + string.digits + "!@#$%^&*()"
+    return ''.join(secrets.choice(alphabet) for _ in range(length))
+
 
 class TiDBBranchManager:
-    """Manages TiDB Cloud branch lifecycle via REST API."""
+    """Manages TiDB Cloud branch lifecycle via REST API (v1beta1)."""
 
     def __init__(self):
         self.public_key = os.getenv('TIDB_CLOUD_PUBLIC_KEY')
         self.private_key = os.getenv('TIDB_CLOUD_PRIVATE_KEY')
         self.project_id = os.getenv('TIDB_CLOUD_PROJECT_ID')
         self.cluster_id = os.getenv('TIDB_CLOUD_CLUSTER_ID')
-        self.base_url = "https://api.tidbcloud.com/api/v1beta"
+        # v1beta1 serverless API — uses camelCase fields
+        self.base_url = "https://serverless.tidbapi.com/v1beta1"
 
     @property
     def _auth(self):
@@ -47,12 +60,23 @@ class TiDBBranchManager:
         """
         Creates a new branch and waits until it's ACTIVE.
 
+        A random root password is generated and passed during creation so the
+        branch is immediately connectable without any manual console step.
+
         Returns:
-            dict with keys: branch_id, host, port, user, password, status
+            dict with keys: branch_id, branch_name, host, port, user, password, status
         """
         print(f"🔀 Creating branch '{branch_name}'...")
 
-        payload = {"displayName": branch_name}
+        # Generate a fresh password for this branch's root user.
+        # Passing rootPassword in the create payload causes TiDB Cloud to set
+        # has-set-password=true so the branch is connectable right away.
+        branch_password = _generate_password()
+
+        payload = {
+            "displayName": branch_name,
+            "rootPassword": branch_password,
+        }
         response = requests.post(
             self._branches_url,
             json=payload,
@@ -66,14 +90,18 @@ class TiDBBranchManager:
             )
 
         branch_data = response.json()
-        branch_id = branch_data.get('id') or branch_data.get('branchId')
+        branch_id = branch_data.get('branchId') or branch_data.get('id')
+
+        # Remember the password so _wait_for_active can return it
+        _branch_passwords[branch_id] = branch_password
 
         # Poll until the branch is ready
-        return self._wait_for_active(branch_id, timeout_seconds)
+        return self._wait_for_active(branch_id, branch_password, timeout_seconds)
 
-    def _wait_for_active(self, branch_id: str, timeout_seconds: int = 120) -> dict:
+    def _wait_for_active(self, branch_id: str, branch_password: str,
+                         timeout_seconds: int = 120) -> dict:
         """Polls the branch status until ACTIVE or timeout."""
-        url = f"{self._branches_url}/{branch_id}"
+        url = f"{self._branches_url}/{branch_id}?view=FULL"
         start = time.time()
         poll_interval = 3  # seconds
 
@@ -86,14 +114,14 @@ class TiDBBranchManager:
             state = data.get('state', '').upper()
 
             if state in ('ACTIVE', 'READY'):
-                # Extract connection info
+                # v1beta1 uses camelCase: userPrefix, displayName, endpoints.public.host/port
                 endpoints = data.get('endpoints', {})
                 public_ep = endpoints.get('public', {})
                 raw_host = public_ep.get('host', '') or os.getenv('TIDB_HOST', '')
-                branch_user = data.get('userPrefix', '') + '.root'
+                user_prefix = data.get('userPrefix', '')
+                branch_user = f"{user_prefix}.root" if user_prefix else os.getenv('TIDB_USER', '')
 
                 # On TiDB Starter, branches share the production gateway hostname.
-                # Use the REAL host so the connection actually resolves.
                 # The safety check in apply_ddl_on_branch compares the USER prefix
                 # (not the host) to distinguish branch from production — branches
                 # always get a different userPrefix from the TiDB Cloud API.
@@ -103,7 +131,7 @@ class TiDBBranchManager:
                     "host": raw_host,
                     "port": int(public_ep.get('port', 4000)),
                     "user": branch_user,
-                    "password": os.getenv('TIDB_PASSWORD', ''),
+                    "password": branch_password,
                     "status": state,
                 }
             elif state in ('FAILED', 'DELETED'):
@@ -126,7 +154,7 @@ class TiDBBranchManager:
         branches = data.get('branches', data.get('items', []))
         return [
             {
-                "branch_id": b.get('id') or b.get('branchId'),
+                "branch_id": b.get('branchId') or b.get('id'),
                 "name": b.get('displayName', ''),
                 "state": b.get('state', ''),
                 "created_at": b.get('createTime', ''),
@@ -141,10 +169,43 @@ class TiDBBranchManager:
 
         if response.status_code in (200, 204):
             print(f"🗑️  Branch {branch_id} deleted.")
+            _branch_passwords.pop(branch_id, None)
             return True
         else:
             print(f"⚠️  Failed to delete branch: {response.status_code} — {response.text}")
             return False
+
+    def delete_branch_by_name(self, branch_name: str) -> dict:
+        """
+        Looks up a branch by display name, then deletes it.
+
+        Returns:
+            dict with keys: success (bool), message, branch_id (if found).
+        """
+        branches = self.list_branches()
+        matches = [b for b in branches if b['name'] == branch_name]
+
+        if not matches:
+            names = [b['name'] for b in branches]
+            return {
+                "success": False,
+                "message": f"No branch named '{branch_name}' found. Existing branches: {names}",
+            }
+
+        if len(matches) > 1:
+            ids = [b['branch_id'] for b in matches]
+            return {
+                "success": False,
+                "message": f"Multiple branches named '{branch_name}': {ids}. Delete by ID to disambiguate.",
+            }
+
+        branch_id = matches[0]['branch_id']
+        ok = self.delete_branch(branch_id)
+        return {
+            "success": ok,
+            "branch_id": branch_id,
+            "message": f"Branch '{branch_name}' ({branch_id}) deleted." if ok else f"Failed to delete '{branch_name}'.",
+        }
 
     def cleanup_agent_branches(self):
         """Deletes all branches created by this agent (prefixed with 'fix-')."""
