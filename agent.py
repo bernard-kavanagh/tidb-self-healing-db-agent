@@ -26,6 +26,7 @@ from langgraph.prebuilt import create_react_agent
 from langchain_core.messages import HumanMessage, AIMessage, ToolMessage, SystemMessage
 
 from tools import ALL_TOOLS
+from db_manager import db_manager
 
 load_dotenv()
 
@@ -226,6 +227,8 @@ if "messages" not in st.session_state:
     st.session_state.messages = []   # list of {"role", "content", "tool_calls"}
 if "active_branch" not in st.session_state:
     st.session_state.active_branch = None  # {"name", "branch_id", "host", ...}
+if "active_cluster" not in st.session_state:
+    st.session_state.active_cluster = db_manager.cluster_names[0] if db_manager.cluster_names else "default"
 if "run_diagnostic" not in st.session_state:
     st.session_state.run_diagnostic = False
 
@@ -239,10 +242,27 @@ with st.sidebar:
     st.markdown(f"**Autonomous DBA**  \nPowered by TiDB + {provider_label}")
     st.divider()
 
-    # Connection status
-    st.markdown("### 🔌 Connections")
-    tidb_host = os.getenv("TIDB_HOST", "not configured")
-    st.markdown(f"**Production:** `{tidb_host[:40]}`")
+    # Cluster selector
+    st.markdown("### 🔌 Target Cluster")
+    cluster_names = db_manager.cluster_names
+    if len(cluster_names) > 1:
+        selected_cluster = st.selectbox(
+            "Active cluster",
+            cluster_names,
+            index=cluster_names.index(st.session_state.active_cluster)
+                  if st.session_state.active_cluster in cluster_names else 0,
+            label_visibility="collapsed",
+        )
+        if selected_cluster != st.session_state.active_cluster:
+            st.session_state.active_cluster = selected_cluster
+            st.rerun()
+    else:
+        selected_cluster = cluster_names[0] if cluster_names else "default"
+        st.markdown(f"**`{selected_cluster}`**")
+
+    db_manager.set_active_cluster(selected_cluster)
+    active_host = db_manager.prod_config.get("host", "not configured")
+    st.markdown(f"<small>`{active_host[:50]}`</small>", unsafe_allow_html=True)
 
     if st.session_state.active_branch:
         b = st.session_state.active_branch

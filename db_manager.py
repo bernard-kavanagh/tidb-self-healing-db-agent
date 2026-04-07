@@ -15,25 +15,81 @@ load_dotenv()
 
 
 class TiDBConnectionManager:
-    """Manages TiDB connections for production and branch endpoints."""
+    """Manages connections to one or more named TiDB clusters."""
 
     def __init__(self):
         self.ssl_ca = os.getenv('TIDB_SSL_CA', '/Users/bernardkavanagh/downloads/isrgrootx1.pem')
-        self.prod_config = {
-            'host': os.getenv('TIDB_HOST'),
-            'port': int(os.getenv('TIDB_PORT', 4000)),
-            'user': os.getenv('TIDB_USER'),
-            'password': os.getenv('TIDB_PASSWORD'),
-            'database': os.getenv('TIDB_DATABASE', 'dba_agent_db'),
-            'ssl_ca': self.ssl_ca,
-            'autocommit': True,
-        }
+        self._clusters = self._load_clusters()
+        self._active_cluster = list(self._clusters.keys())[0] if self._clusters else None
+
+    def _load_clusters(self) -> dict:
+        """
+        Build a dict of cluster configs from env vars.
+
+        Multi-cluster format (TIDB_CLUSTERS=prod-us,prod-eu):
+            TIDB_PROD_US_HOST, TIDB_PROD_US_USER, TIDB_PROD_US_PASSWORD, ...
+            TIDB_PROD_EU_HOST, TIDB_PROD_EU_USER, TIDB_PROD_EU_PASSWORD, ...
+
+        Single-cluster fallback (backward-compatible):
+            TIDB_HOST, TIDB_USER, TIDB_PASSWORD, ...  → stored as "default"
+        """
+        clusters = {}
+        cluster_str = os.getenv("TIDB_CLUSTERS", "").strip()
+
+        if cluster_str:
+            for name in [n.strip() for n in cluster_str.split(",") if n.strip()]:
+                env_key = name.upper().replace("-", "_")
+                host = os.getenv(f"TIDB_{env_key}_HOST")
+                if host:
+                    clusters[name] = {
+                        'host': host,
+                        'port': int(os.getenv(f"TIDB_{env_key}_PORT", 4000)),
+                        'user': os.getenv(f"TIDB_{env_key}_USER"),
+                        'password': os.getenv(f"TIDB_{env_key}_PASSWORD"),
+                        'database': os.getenv(f"TIDB_{env_key}_DATABASE", 'dba_agent_db'),
+                        'ssl_ca': self.ssl_ca,
+                        'autocommit': True,
+                    }
+
+        # Fallback: legacy single-cluster env vars → "default"
+        if not clusters:
+            clusters["default"] = {
+                'host': os.getenv("TIDB_HOST"),
+                'port': int(os.getenv("TIDB_PORT", 4000)),
+                'user': os.getenv("TIDB_USER"),
+                'password': os.getenv("TIDB_PASSWORD"),
+                'database': os.getenv("TIDB_DATABASE", 'dba_agent_db'),
+                'ssl_ca': self.ssl_ca,
+                'autocommit': True,
+            }
+
+        return clusters
+
+    @property
+    def cluster_names(self) -> list:
+        return list(self._clusters.keys())
+
+    @property
+    def active_cluster_name(self) -> str:
+        return self._active_cluster or "default"
+
+    @property
+    def prod_config(self) -> dict:
+        return self._clusters.get(self._active_cluster, {})
+
+    def set_active_cluster(self, name: str):
+        """Switch the active cluster. All subsequent tool calls target this cluster."""
+        if name in self._clusters:
+            self._active_cluster = name
 
     # ── Connection Factories ──────────────────────────────────────
 
     def get_prod_connection(self):
-        """Returns a connection to the PRODUCTION database."""
-        return mysql.connector.connect(**self.prod_config)
+        """Returns a connection to the ACTIVE cluster."""
+        config = self._clusters.get(self._active_cluster)
+        if not config:
+            raise ValueError(f"No cluster config found for '{self._active_cluster}'")
+        return mysql.connector.connect(**config)
 
     def get_branch_connection(self, host: str, port: int, user: str, password: str, database: str = None):
         """Returns a connection to a BRANCH database."""
