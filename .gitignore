@@ -13,3 +13,5 @@ venv/
 *.db
 *.sqlite
 isrgrootx1.pem
+__pycache__/
+*.pyc

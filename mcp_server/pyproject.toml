@@ -1,0 +1,23 @@
+[project]
+name = "dba-agent-mcp"
+version = "0.1.0"
+description = "MCP server exposing TiDB Cloud DBA tools (branch sandbox, hotspot detection, slow-query analysis, episodic memory)."
+requires-python = ">=3.10"
+dependencies = [
+    "fastmcp",
+    "pymysql",
+    "python-dotenv",
+    "sentence-transformers",
+    "tidb-vector",
+    "mysql-connector-python",
+    "requests",
+    "sqlalchemy",
+]
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["mcp_server", "mcp_server.tools"]
+package-dir = {"mcp_server" = "", "mcp_server.tools" = "tools"}
